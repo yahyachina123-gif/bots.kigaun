@@ -1,24 +1,22 @@
 import discord
 from discord.ext import commands
-import asyncio
 import os
 import random
 import string
+import json
 from datetime import datetime, timedelta
 import motor.motor_asyncio
 
-# ===== CONFIG =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# ===== DATABASE =====
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = client.lightpanel
 licenses = db.licenses
 users = db.users
+blacklist = db.blacklist
+logs = db.logs
 
-# ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -28,23 +26,31 @@ def generate_key():
     return "LP-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
 
 def get_expiry(duration):
-    if duration == "1d": return datetime.now() + timedelta(days=1)
-    if duration == "1w": return datetime.now() + timedelta(weeks=1)
-    if duration == "1m": return datetime.now() + timedelta(days=30)
-    if duration == "1y": return datetime.now() + timedelta(days=365)
-    if duration == "lifetime": return datetime.now() + timedelta(days=3650)
-    return datetime.now() + timedelta(days=7)
+    now = datetime.now()
+    if duration == "1d": return now + timedelta(days=1)
+    if duration == "1w": return now + timedelta(weeks=1)
+    if duration == "1m": return now + timedelta(days=30)
+    if duration == "1y": return now + timedelta(days=365)
+    if duration == "lifetime": return now + timedelta(days=3650)
+    return now + timedelta(days=7)
+
+async def log_action(action, user, moderator, reason):
+    await logs.insert_one({
+        "action": action, "user": str(user), "moderator": str(moderator),
+        "reason": reason, "timestamp": datetime.now()
+    })
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot online as {bot.user}")
+    print(f"✅ Bot online: {bot.user}")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="LightPanel Pro"))
+
+# ========== LICENSE COMMANDS ==========
 
 @bot.command(name="gen")
 @commands.has_permissions(administrator=True)
 async def gen_key(ctx, duration: str = "7d", amount: int = 1):
-    """!gen 1d/1w/1m/1y/lifetime [amount]"""
-    valid = ["1d", "1w", "1m", "1y", "lifetime"]
+    valid = ["1d", "1w", "1m", "1y", "lifetime", "7d"]
     if duration not in valid:
         await ctx.send(f"❌ Use: {', '.join(valid)}")
         return
@@ -55,121 +61,153 @@ async def gen_key(ctx, duration: str = "7d", amount: int = 1):
     keys = []
     for _ in range(amount):
         key = generate_key()
-        expiry = get_expiry(duration)
         await licenses.insert_one({
-            "key": key,
-            "duration": duration,
-            "expiry": expiry,
-            "used_by": None,
-            "used_at": None,
-            "hwid": None,
-            "created_by": str(ctx.author.id),
-            "created_at": datetime.now(),
-            "revoked": False
+            "key": key, "duration": duration, "expiry": get_expiry(duration),
+            "used_by": None, "used_by_discord": None, "used_at": None, "hwid": None,
+            "created_by": str(ctx.author.id), "created_at": datetime.now(), "revoked": False, "type": duration
         })
         keys.append(key)
     
-    msg = f"✅ Generated {amount} key(s):\n```\n" + "\n".join(keys) + "\n```"
-    await ctx.send(msg)
+    await ctx.send(f"✅ Generated {amount} key(s):\n```\n" + "\n".join(keys) + "\n```")
+    await log_action("generate", ctx.author, ctx.author, f"{amount}x {duration}")
 
 @bot.command(name="redeem")
 async def redeem_key(ctx, key: str = None):
-    """!redeem LP-XXXX-XXXX"""
     if not key:
         await ctx.send("❌ Usage: `!redeem LP-XXXX-XXXX`")
         return
     
-    license_data = await licenses.find_one({"key": key.upper()})
+    data = await licenses.find_one({"key": key.upper()})
     
-    if not license_data:
+    if not data:
         await ctx.send("❌ Invalid license key!")
         return
-    if license_data.get("revoked"):
-        await ctx.send("❌ License revoked!")
+    if data.get("revoked"):
+        await ctx.send("❌ This license has been revoked!")
         return
-    if license_data.get("used_by"):
-        await ctx.send("❌ License already used!")
+    if data.get("used_by"):
+        await ctx.send("❌ This license is already in use!")
         return
-    if license_data["expiry"] < datetime.now():
-        await ctx.send("❌ License expired!")
+    if data["expiry"] < datetime.now():
+        await ctx.send("❌ This license has expired!")
         return
     
     await licenses.update_one(
         {"key": key.upper()},
         {"$set": {
-            "used_by": str(ctx.author.id),
-            "used_at": datetime.now(),
-            "discord_name": str(ctx.author)
+            "used_by": str(ctx.author.id), "used_by_discord": str(ctx.author),
+            "used_at": datetime.now(), "hwid": str(ctx.author.id)
         }}
     )
     
     await users.update_one(
         {"discord_id": str(ctx.author.id)},
         {"$set": {
-            "name": str(ctx.author),
-            "license_key": key.upper(),
-            "expiry": license_data["expiry"]
+            "name": str(ctx.author), "license_key": key.upper(),
+            "expiry": data["expiry"], "type": data.get("duration", "unknown")
         }},
         upsert=True
     )
     
-    await ctx.send(f"✅ License redeemed!\n📅 Expires: {license_data['expiry'].strftime('%Y-%m-%d')}")
-
-@bot.command(name="list")
-@commands.has_permissions(administrator=True)
-async def list_keys(ctx):
-    """!list - Show all licenses"""
-    cursor = licenses.find().limit(25)
-    results = await cursor.to_list(length=25)
-    if not results:
-        await ctx.send("No licenses found")
-        return
-    
-    msg = "**📋 Licenses:**\n```\n"
-    for lic in results:
-        used = "USED" if lic.get("used_by") else "FREE"
-        revoked = "REVOKED" if lic.get("revoked") else ""
-        msg += f"{lic['key']} | {used} | {lic['expiry'].strftime('%Y-%m-%d')} {revoked}\n"
-    msg += "```"
-    await ctx.send(msg)
-
-@bot.command(name="revoke")
-@commands.has_permissions(administrator=True)
-async def revoke_key(ctx, key: str):
-    """!revoke LP-XXXX-XXXX"""
-    result = await licenses.update_one(
-        {"key": key.upper()},
-        {"$set": {"revoked": True}}
-    )
-    if result.modified_count:
-        await ctx.send(f"✅ Revoked: {key}")
-    else:
-        await ctx.send(f"❌ Key not found")
+    await ctx.send(f"✅ License redeemed!\n📅 Expires: {data['expiry'].strftime('%Y-%m-%d')}")
 
 @bot.command(name="grant")
 @commands.has_permissions(administrator=True)
-async def grant_time(ctx, user: discord.User, duration: str):
-    """!grant @user 1m/1w/1y"""
+async def grant_time(ctx, user: discord.User, duration: str, *, reason: str = "No reason"):
     user_data = await users.find_one({"discord_id": str(user.id)})
     if not user_data:
-        await ctx.send(f"❌ {user.mention} has no license")
+        await ctx.send(f"❌ {user.mention} doesn't have a license!")
         return
     
     new_expiry = get_expiry(duration)
-    await users.update_one(
-        {"discord_id": str(user.id)},
-        {"$set": {"expiry": new_expiry}}
-    )
-    await licenses.update_one(
-        {"key": user_data["license_key"]},
-        {"$set": {"expiry": new_expiry}}
-    )
-    await ctx.send(f"✅ Granted {duration} to {user.mention}\n📅 New expiry: {new_expiry.strftime('%Y-%m-%d')}")
+    old_expiry = user_data.get("expiry")
+    if old_expiry and old_expiry > datetime.now():
+        new_expiry = old_expiry + (new_expiry - datetime.now())
+    
+    await users.update_one({"discord_id": str(user.id)}, {"$set": {"expiry": new_expiry}})
+    await licenses.update_one({"key": user_data["license_key"]}, {"$set": {"expiry": new_expiry}})
+    
+    await ctx.send(f"✅ Granted {duration} to {user.mention}\n📅 New expiry: {new_expiry.strftime('%Y-%m-%d')}\n📝 Reason: {reason}")
+    
+    try:
+        embed = discord.Embed(title="✅ License Extended", color=discord.Color.green())
+        embed.add_field(name="Duration", value=duration, inline=True)
+        embed.add_field(name="New Expiry", value=new_expiry.strftime('%Y-%m-%d'), inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await user.send(embed=embed)
+    except:
+        pass
+
+@bot.command(name="terminate")
+@commands.has_permissions(administrator=True)
+async def terminate_key(ctx, user: discord.User, *, reason: str = "No reason"):
+    user_data = await users.find_one({"discord_id": str(user.id)})
+    if not user_data:
+        await ctx.send(f"❌ {user.mention} doesn't have a license!")
+        return
+    
+    await users.update_one({"discord_id": str(user.id)}, {"$set": {"expiry": datetime.now(), "revoked": True}})
+    await licenses.update_one({"key": user_data["license_key"]}, {"$set": {"revoked": True}})
+    
+    await ctx.send(f"✅ Terminated {user.mention}'s license\n📝 Reason: {reason}")
+    
+    try:
+        embed = discord.Embed(title="❌ License Terminated", color=discord.Color.red())
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await user.send(embed=embed)
+    except:
+        pass
 
 @bot.command(name="stats")
-async def bot_stats(ctx):
-    total = await licenses.count_documents({})
-    used = await licenses.count_documents({"used_by": {"$ne": None}})
-    await ctx.send(f"📊 **Stats:**\nTotal Licenses: {total}\nUsed: {used}")
+async def show_stats(ctx):
+    await ctx.send(f"📊 Dashboard: https://lightpanel-bot.up.railway.app/")
+
+# ========== MODERATION COMMANDS ==========
+
+@bot.command(name="ban")
+@commands.has_permissions(ban_members=True)
+async def ban_user(ctx, user: discord.User, *, reason: str = "No reason"):
+    await ctx.guild.ban(user, reason=reason)
+    await ctx.send(f"✅ Banned {user.mention}\nReason: {reason}")
+
+@bot.command(name="kick")
+@commands.has_permissions(kick_members=True)
+async def kick_user(ctx, user: discord.User, *, reason: str = "No reason"):
+    await ctx.guild.kick(user, reason=reason)
+    await ctx.send(f"✅ Kicked {user.mention}\nReason: {reason}")
+
+@bot.command(name="timeout")
+@commands.has_permissions(moderate_members=True)
+async def timeout_user(ctx, user: discord.User, minutes: int = 5, *, reason: str = "No reason"):
+    duration = timedelta(minutes=minutes)
+    await user.timeout(duration, reason=reason)
+    await ctx.send(f"✅ Timed out {user.mention} for {minutes} minutes\nReason: {reason}")
+
+@bot.command(name="clear")
+@commands.has_permissions(manage_messages=True)
+async def clear_messages(ctx, amount: int = 10):
+    if amount > 100:
+        amount = 100
+    deleted = await ctx.channel.purge(limit=amount)
+    await ctx.send(f"✅ Cleared {len(deleted)} messages", delete_after=3)
+
+@bot.command(name="ping")
+async def ping(ctx):
+    await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)}ms")
+
+@bot.command(name="commands")
+async def list_commands(ctx):
+    await ctx.send("""
+**LightPanel Pro Commands:**
+`!gen 1d` - Generate key
+`!redeem LP-XXXX` - Redeem key
+`!grant @user 1m` - Extend license
+`!terminate @user` - Revoke license
+`!ban @user` - Ban user
+`!kick @user` - Kick user
+`!timeout @user 5` - Timeout user
+`!stats` - Dashboard link
+`!ping` - Check bot
+""")
 
 bot.run(TOKEN)
