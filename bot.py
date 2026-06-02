@@ -9,6 +9,7 @@ import motor.motor_asyncio
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
+OWNER_ID = 1508819982132183067  # Only this user can use commands
 
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = client.lightpanel
@@ -33,9 +34,15 @@ def get_expiry(duration):
     if duration == "lifetime": return now + timedelta(days=3650)
     return now + timedelta(days=7)
 
+def is_owner():
+    async def predicate(interaction: discord.Interaction):
+        return interaction.user.id == OWNER_ID
+    return app_commands.check(predicate)
+
 @bot.event
 async def on_ready():
     print(f"✅ Bot online: {bot.user}")
+    print(f"✅ Owner ID: {OWNER_ID}")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="LightPanel Pro"))
     try:
         synced = await bot.tree.sync()
@@ -43,12 +50,15 @@ async def on_ready():
     except Exception as e:
         print(f"Sync error: {e}")
 
-# ========== SLASH COMMANDS ==========
+# ========== SLASH COMMANDS (Owner Only) ==========
 
 @bot.tree.command(name="gen", description="Generate a license key")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(duration="1d, 1w, 1m, 1y, lifetime", amount="Number of keys (1-10)")
 async def slash_gen(interaction: discord.Interaction, duration: str = "7d", amount: int = 1):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     valid = ["1d", "1w", "1m", "1y", "lifetime", "7d"]
     if duration not in valid:
         await interaction.response.send_message(f"❌ Invalid duration. Use: {', '.join(valid)}", ephemeral=True)
@@ -72,6 +82,10 @@ async def slash_gen(interaction: discord.Interaction, duration: str = "7d", amou
 @bot.tree.command(name="redeem", description="Redeem your license key")
 @app_commands.describe(key="Your license key (LP-XXXX-XXXX)")
 async def slash_redeem(interaction: discord.Interaction, key: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     data = await licenses.find_one({"key": key.upper()})
     
     if not data:
@@ -101,9 +115,12 @@ async def slash_redeem(interaction: discord.Interaction, key: str):
     await interaction.response.send_message(f"✅ License redeemed!\n📅 Expires: {data['expiry'].strftime('%Y-%m-%d')}")
 
 @bot.tree.command(name="grant", description="Extend a user's license")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="User to grant", duration="1d, 1w, 1m, 1y, lifetime", reason="Reason for grant")
-async def slash_grant(interaction: discord.Interaction, user: discord.User, duration: str, reason: str = "No reason"):
+async def slash_grant(interaction: discord.Interaction, user: discord.User, duration: str, reason: str = "No reason provided"):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     user_data = await users.find_one({"discord_id": str(user.id)})
     if not user_data:
         await interaction.response.send_message(f"❌ {user.mention} doesn't have a license!", ephemeral=True)
@@ -119,15 +136,24 @@ async def slash_grant(interaction: discord.Interaction, user: discord.User, dura
     
     await interaction.response.send_message(f"✅ Granted {duration} to {user.mention}\n📅 New expiry: {new_expiry.strftime('%Y-%m-%d')}\n📝 Reason: {reason}")
     
+    # DM the user
     try:
-        await user.send(f"✅ Your LightPanel Pro license has been extended!\n📅 New expiry: {new_expiry.strftime('%Y-%m-%d')}\n📝 Reason: {reason}")
+        embed = discord.Embed(title="✅ License Extended - LightPanel Pro", color=discord.Color.green())
+        embed.add_field(name="Duration Added", value=duration, inline=True)
+        embed.add_field(name="New Expiry", value=new_expiry.strftime('%Y-%m-%d'), inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text="LightPanel Pro")
+        await user.send(embed=embed)
     except:
         pass
 
 @bot.tree.command(name="terminate", description="Revoke a user's license")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="User to terminate", reason="Reason for termination")
-async def slash_terminate(interaction: discord.Interaction, user: discord.User, reason: str = "No reason"):
+async def slash_terminate(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided"):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     user_data = await users.find_one({"discord_id": str(user.id)})
     if not user_data:
         await interaction.response.send_message(f"❌ {user.mention} doesn't have a license!", ephemeral=True)
@@ -138,24 +164,60 @@ async def slash_terminate(interaction: discord.Interaction, user: discord.User, 
     
     await interaction.response.send_message(f"✅ Terminated {user.mention}'s license\n📝 Reason: {reason}")
     
+    # DM the user
     try:
-        await user.send(f"❌ Your LightPanel Pro license has been terminated.\n📝 Reason: {reason}")
+        embed = discord.Embed(title="❌ License Terminated - LightPanel Pro", color=discord.Color.red())
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text="LightPanel Pro")
+        await user.send(embed=embed)
     except:
         pass
 
 @bot.tree.command(name="stats", description="Show license statistics")
 async def slash_stats(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     total = await licenses.count_documents({})
     used = await licenses.count_documents({"used_by": {"$ne": None}})
     active = await users.count_documents({"expiry": {"$gt": datetime.now()}})
-    await interaction.response.send_message(f"📊 **Statistics:**\nTotal Licenses: {total}\nUsed: {used}\nActive Users: {active}")
+    await interaction.response.send_message(f"📊 **LightPanel Pro Statistics**\n\nTotal Licenses: {total}\nUsed Licenses: {used}\nActive Users: {active}")
 
 @bot.tree.command(name="dashboard", description="Get dashboard link")
 async def slash_dashboard(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📊 **Dashboard:**\nhttps://lightpanel-bot.up.railway.app/")
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    await interaction.response.send_message(f"📊 **LightPanel Pro Dashboard**\nhttps://botskigaun-production.up.railway.app/\n\nLogin with your admin key")
 
 @bot.tree.command(name="ping", description="Check bot latency")
 async def slash_ping(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
     await interaction.response.send_message(f"🏓 Pong! {round(bot.latency * 1000)}ms")
+
+@bot.tree.command(name="users", description="List all users with licenses")
+async def slash_users(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    cursor = users.find()
+    user_list = []
+    async for doc in cursor:
+        user_list.append(f"• {doc.get('name', 'Unknown')} - Expires: {doc['expiry'].strftime('%Y-%m-%d') if doc.get('expiry') else 'Never'}")
+    
+    if not user_list:
+        await interaction.response.send_message("No users found.")
+        return
+    
+    # Split into chunks if too long
+    chunks = [user_list[i:i+20] for i in range(0, len(user_list), 20)]
+    for chunk in chunks:
+        await interaction.response.send_message(f"**Users:**\n" + "\n".join(chunk))
 
 bot.run(TOKEN)
