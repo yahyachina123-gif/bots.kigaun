@@ -3,7 +3,6 @@ from discord.ext import commands
 import os
 import random
 import string
-import json
 from datetime import datetime, timedelta
 import motor.motor_asyncio
 
@@ -14,12 +13,13 @@ client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = client.lightpanel
 licenses = db.licenses
 users = db.users
-blacklist = db.blacklist
-logs = db.logs
 
+# ========== BOT SETUP ==========
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 def generate_key():
@@ -34,28 +34,27 @@ def get_expiry(duration):
     if duration == "lifetime": return now + timedelta(days=3650)
     return now + timedelta(days=7)
 
-async def log_action(action, user, moderator, reason):
-    await logs.insert_one({
-        "action": action, "user": str(user), "moderator": str(moderator),
-        "reason": reason, "timestamp": datetime.now()
-    })
-
 @bot.event
 async def on_ready():
     print(f"✅ Bot online: {bot.user}")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="LightPanel Pro"))
+    
+    # Sync commands and send startup message
+    channel = bot.get_channel(123456789012345678)  # Replace with your channel ID or remove
+    print("Bot is ready! Commands: !gen, !redeem, !grant, !terminate, !ping, !commands")
 
 # ========== LICENSE COMMANDS ==========
 
 @bot.command(name="gen")
 @commands.has_permissions(administrator=True)
 async def gen_key(ctx, duration: str = "7d", amount: int = 1):
+    """Generate a license key - !gen 1d/1w/1m/1y/lifetime [amount]"""
     valid = ["1d", "1w", "1m", "1y", "lifetime", "7d"]
     if duration not in valid:
-        await ctx.send(f"❌ Use: {', '.join(valid)}")
+        await ctx.send(f"❌ Invalid duration. Use: {', '.join(valid)}")
         return
     if amount > 10:
-        await ctx.send("❌ Max 10 keys")
+        await ctx.send("❌ Max 10 keys at once")
         return
     
     keys = []
@@ -69,10 +68,10 @@ async def gen_key(ctx, duration: str = "7d", amount: int = 1):
         keys.append(key)
     
     await ctx.send(f"✅ Generated {amount} key(s):\n```\n" + "\n".join(keys) + "\n```")
-    await log_action("generate", ctx.author, ctx.author, f"{amount}x {duration}")
 
 @bot.command(name="redeem")
 async def redeem_key(ctx, key: str = None):
+    """Redeem a license key - !redeem LP-XXXX-XXXX"""
     if not key:
         await ctx.send("❌ Usage: `!redeem LP-XXXX-XXXX`")
         return
@@ -114,6 +113,7 @@ async def redeem_key(ctx, key: str = None):
 @bot.command(name="grant")
 @commands.has_permissions(administrator=True)
 async def grant_time(ctx, user: discord.User, duration: str, *, reason: str = "No reason"):
+    """Grant extension - !grant @user 1m/1w/1y [reason]"""
     user_data = await users.find_one({"discord_id": str(user.id)})
     if not user_data:
         await ctx.send(f"❌ {user.mention} doesn't have a license!")
@@ -141,6 +141,7 @@ async def grant_time(ctx, user: discord.User, duration: str, *, reason: str = "N
 @bot.command(name="terminate")
 @commands.has_permissions(administrator=True)
 async def terminate_key(ctx, user: discord.User, *, reason: str = "No reason"):
+    """Terminate license - !terminate @user [reason]"""
     user_data = await users.find_one({"discord_id": str(user.id)})
     if not user_data:
         await ctx.send(f"❌ {user.mention} doesn't have a license!")
@@ -158,27 +159,57 @@ async def terminate_key(ctx, user: discord.User, *, reason: str = "No reason"):
     except:
         pass
 
+@bot.command(name="dashboard")
+async def dashboard_link(ctx):
+    """Get dashboard link"""
+    await ctx.send(f"📊 **LightPanel Pro Dashboard**\nhttps://lightpanel-bot.up.railway.app/\n\nLogin with admin key")
+
 @bot.command(name="stats")
 async def show_stats(ctx):
-    await ctx.send(f"📊 Dashboard: https://lightpanel-bot.up.railway.app/")
+    """Show license statistics"""
+    total = await licenses.count_documents({})
+    used = await licenses.count_documents({"used_by": {"$ne": None}})
+    active = await users.count_documents({"expiry": {"$gt": datetime.now()}})
+    await ctx.send(f"📊 **Statistics:**\nTotal Licenses: {total}\nUsed: {used}\nActive Users: {active}")
+
+@bot.command(name="ping")
+async def ping(ctx):
+    """Check bot latency"""
+    await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)}ms")
+
+@bot.command(name="helpme")
+async def help_command(ctx):
+    """Show all commands"""
+    embed = discord.Embed(title="LightPanel Pro Commands", color=discord.Color.blue())
+    embed.add_field(name="!gen 1d/1w/1m/1y/lifetime", value="Generate license key (Admin only)", inline=False)
+    embed.add_field(name="!redeem LP-XXXX-XXXX", value="Redeem your license key", inline=False)
+    embed.add_field(name="!grant @user 1m/1w/1y", value="Extend user's license (Admin)", inline=False)
+    embed.add_field(name="!terminate @user", value="Revoke user's license (Admin)", inline=False)
+    embed.add_field(name="!stats", value="Show license statistics", inline=False)
+    embed.add_field(name="!dashboard", value="Get dashboard link", inline=False)
+    embed.add_field(name="!ping", value="Check bot latency", inline=False)
+    await ctx.send(embed=embed)
 
 # ========== MODERATION COMMANDS ==========
 
 @bot.command(name="ban")
 @commands.has_permissions(ban_members=True)
 async def ban_user(ctx, user: discord.User, *, reason: str = "No reason"):
+    """Ban a user"""
     await ctx.guild.ban(user, reason=reason)
     await ctx.send(f"✅ Banned {user.mention}\nReason: {reason}")
 
 @bot.command(name="kick")
 @commands.has_permissions(kick_members=True)
 async def kick_user(ctx, user: discord.User, *, reason: str = "No reason"):
+    """Kick a user"""
     await ctx.guild.kick(user, reason=reason)
     await ctx.send(f"✅ Kicked {user.mention}\nReason: {reason}")
 
 @bot.command(name="timeout")
 @commands.has_permissions(moderate_members=True)
 async def timeout_user(ctx, user: discord.User, minutes: int = 5, *, reason: str = "No reason"):
+    """Timeout a user"""
     duration = timedelta(minutes=minutes)
     await user.timeout(duration, reason=reason)
     await ctx.send(f"✅ Timed out {user.mention} for {minutes} minutes\nReason: {reason}")
@@ -186,28 +217,10 @@ async def timeout_user(ctx, user: discord.User, minutes: int = 5, *, reason: str
 @bot.command(name="clear")
 @commands.has_permissions(manage_messages=True)
 async def clear_messages(ctx, amount: int = 10):
+    """Clear messages"""
     if amount > 100:
         amount = 100
     deleted = await ctx.channel.purge(limit=amount)
     await ctx.send(f"✅ Cleared {len(deleted)} messages", delete_after=3)
-
-@bot.command(name="ping")
-async def ping(ctx):
-    await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)}ms")
-
-@bot.command(name="commands")
-async def list_commands(ctx):
-    await ctx.send("""
-**LightPanel Pro Commands:**
-`!gen 1d` - Generate key
-`!redeem LP-XXXX` - Redeem key
-`!grant @user 1m` - Extend license
-`!terminate @user` - Revoke license
-`!ban @user` - Ban user
-`!kick @user` - Kick user
-`!timeout @user 5` - Timeout user
-`!stats` - Dashboard link
-`!ping` - Check bot
-""")
 
 bot.run(TOKEN)
