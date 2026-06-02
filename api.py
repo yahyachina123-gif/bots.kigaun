@@ -1,7 +1,6 @@
-from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from datetime import datetime
 import motor.motor_asyncio
@@ -9,7 +8,6 @@ import os
 import random
 import string
 import hashlib
-from typing import Optional
 
 app = FastAPI()
 
@@ -29,7 +27,6 @@ db = client.lightpanel
 licenses = db.licenses
 users = db.users
 logs = db.logs
-blacklist = db.blacklist
 
 # ========== MODELS ==========
 class VerifyRequest(BaseModel):
@@ -74,7 +71,6 @@ DASHBOARD_HTML = '''
         button:hover { background: #0099dd; }
         .btn-danger { background: #dc3545; }
         .btn-danger:hover { background: #bb2d3b; }
-        .btn-success { background: #28a745; }
         .status-active { color: #28a745; }
         .status-expired { color: #dc3545; }
         .flex { display: flex; gap: 10px; margin-bottom: 15px; }
@@ -100,7 +96,6 @@ DASHBOARD_HTML = '''
             <div class="nav-item" onclick="showTab('licenses')">🔑 Licenses</div>
             <div class="nav-item" onclick="showTab('users')">👥 Users</div>
             <div class="nav-item" onclick="showTab('generate')">✨ Generate Key</div>
-            <div class="nav-item" onclick="showTab('moderation')">🛡️ Moderation</div>
             <div class="nav-item" onclick="logout()" style="margin-top: 50px;">🚪 Logout</div>
         </div>
 
@@ -120,14 +115,14 @@ DASHBOARD_HTML = '''
                 <div class="card">
                     <h2>All Licenses</h2>
                     <input type="text" id="search" placeholder="Search..." style="width:300px; margin-bottom:15px;">
-                    <div style="overflow-x:auto;"><table id="licenses-table"><table><th>Key</th><th>User</th><th>Type</th><th>Expiry</th><th>Status</th><th>Actions</th></table></div>
+                    <div style="overflow-x:auto;"><table id="licenses-table"><tr><th>Key</th><th>User</th><th>Type</th><th>Expiry</th><th>Status</th><th>Actions</th></tr></div>
                 </div>
             </div>
 
             <div id="users-tab" style="display:none;">
                 <div class="card">
                     <h2>Active Users</h2>
-                    <div style="overflow-x:auto;"><table id="users-table">得到<th>Discord</th><th>License Key</th><th>Type</th><th>Expiry</th><th>HWID</th><th>Actions</th></table></div>
+                    <div style="overflow-x:auto;"><table id="users-table"><tr><th>Discord</th><th>License Key</th><th>Type</th><th>Expiry</th><th>HWID</th><th>Actions</th></tr></div>
                 </div>
             </div>
 
@@ -148,22 +143,6 @@ DASHBOARD_HTML = '''
                     <div id="generated-key" class="mt-3" style="display:none; background:#1a1d2a; padding:15px; border-radius:8px;"></div>
                 </div>
             </div>
-
-            <div id="moderation-tab" style="display:none;">
-                <div class="card">
-                    <h2>Moderation Actions</h2>
-                    <div class="flex">
-                        <input type="text" id="mod-user" placeholder="Discord User ID" style="flex:1;">
-                        <select id="mod-action">
-                            <option value="ban">Ban</option>
-                            <option value="kick">Kick</option>
-                            <option value="timeout">Timeout (5min)</option>
-                        </select>
-                        <input type="text" id="mod-reason" placeholder="Reason" style="flex:1;">
-                        <button onclick="moderateUser()">Execute</button>
-                    </div>
-                </div>
-            </div>
         </div>
     </div>
 
@@ -181,7 +160,8 @@ DASHBOARD_HTML = '''
 
         async function login() {
             const password = document.getElementById('admin-password').value;
-            if (password === '''' + 'LightPanelAdmin2024' + '''') {
+            const correctKey = "LightPanelAdmin2024";
+            if (password === correctKey) {
                 localStorage.setItem('adminKey', password);
                 adminKey = password;
                 checkAuth();
@@ -221,7 +201,7 @@ DASHBOARD_HTML = '''
                     row.insertCell(2).innerText = lic.type;
                     row.insertCell(3).innerText = lic.expiry ? new Date(lic.expiry).toLocaleDateString() : 'Never';
                     row.insertCell(4).innerHTML = lic.revoked ? '<span class="status-expired">Revoked</span>' : '<span class="status-active">Active</span>';
-                    row.insertCell(5).innerHTML = `<button onclick="revokeKey('${lic.key}')" class="btn-danger">Revoke</button>`;
+                    row.insertCell(5).innerHTML = '<button onclick="revokeKey(\\'' + lic.key + '\\')" class="btn-danger">Revoke</button>';
                 });
             }
         }
@@ -238,7 +218,7 @@ DASHBOARD_HTML = '''
                     row.insertCell(2).innerText = user.type;
                     row.insertCell(3).innerText = new Date(user.expiry).toLocaleDateString();
                     row.insertCell(4).innerText = user.hwid || 'Unknown';
-                    row.insertCell(5).innerHTML = `<button onclick="terminateUser('${user.discord_id}')" class="btn-danger">Terminate</button> <button onclick="grantUser('${user.discord_id}')">Grant</button>`;
+                    row.insertCell(5).innerHTML = '<button onclick="terminateUser(\\'' + user.discord_id + '\\')" class="btn-danger">Terminate</button> <button onclick="grantUser(\\'' + user.discord_id + '\\')">Grant</button>';
                 });
             }
         }
@@ -249,7 +229,7 @@ DASHBOARD_HTML = '''
             const result = await apiCall('/api/generate', 'POST', {duration, amount, admin_key: adminKey});
             if (result && result.keys) {
                 document.getElementById('generated-key').style.display = 'block';
-                document.getElementById('generated-key').innerHTML = `<strong>Generated:</strong><br><code>${result.keys.join('<br>')}</code>`;
+                document.getElementById('generated-key').innerHTML = '<strong>Generated:</strong><br><code>' + result.keys.join('<br>') + '</code>';
                 loadLicenses(); loadStats();
             } else { alert('Failed'); }
         }
@@ -257,7 +237,6 @@ DASHBOARD_HTML = '''
         async function revokeKey(key) { if(confirm('Revoke?')){ await apiCall('/api/revoke', 'POST', {key}); loadLicenses(); loadStats(); } }
         async function terminateUser(id) { const reason = prompt('Reason:'); if(reason && confirm('Terminate?')){ await apiCall('/api/terminate', 'POST', {discord_id: id, reason}); loadUsers(); loadStats(); } }
         async function grantUser(id) { const duration = prompt('Duration (1d/1w/1m/1y/lifetime):'); if(duration){ await apiCall('/api/grant', 'POST', {discord_id: id, duration}); loadUsers(); } }
-        async function moderateUser() { alert('Moderation sent to Discord bot'); }
 
         function showTab(tab) {
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
@@ -266,7 +245,6 @@ DASHBOARD_HTML = '''
             document.getElementById('licenses-tab').style.display = tab === 'licenses' ? 'block' : 'none';
             document.getElementById('users-tab').style.display = tab === 'users' ? 'block' : 'none';
             document.getElementById('generate-tab').style.display = tab === 'generate' ? 'block' : 'none';
-            document.getElementById('moderation-tab').style.display = tab === 'moderation' ? 'block' : 'none';
             document.getElementById('page-title').innerText = tab.charAt(0).toUpperCase() + tab.slice(1);
             if (tab === 'licenses') loadLicenses();
             if (tab === 'users') loadUsers();
@@ -367,4 +345,19 @@ async def terminate_user(request: Request):
     if request.headers.get("X-Admin-Key") != ADMIN_KEY:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     await users.update_one({"discord_id": data.get("discord_id")}, {"$set": {"expiry": datetime.now(), "revoked": True}})
+    return {"success": True}
+
+@app.post("/api/grant")
+async def grant_user(request: Request):
+    data = await request.json()
+    if request.headers.get("X-Admin-Key") != ADMIN_KEY:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    duration = data.get("duration")
+    now = datetime.now()
+    if duration == "1d": new_expiry = now + timedelta(days=1)
+    elif duration == "1w": new_expiry = now + timedelta(weeks=1)
+    elif duration == "1m": new_expiry = now + timedelta(days=30)
+    elif duration == "1y": new_expiry = now + timedelta(days=365)
+    else: new_expiry = now + timedelta(days=3650)
+    await users.update_one({"discord_id": data.get("discord_id")}, {"$set": {"expiry": new_expiry}})
     return {"success": True}
